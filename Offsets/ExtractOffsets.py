@@ -5,16 +5,29 @@ import sys
 
 from requests import get
 from gzip import decompress
-from json import loads, dumps
+from json import loads
 import subprocess
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+THREADS_LIMIT = None
 CSVLock = threading.Lock()
 
 machineType = dict(x86=332, x64=34404)
-knownImageVersions = dict(ntoskrnl=list(), wdigest=list())
-extensions_by_mode = dict(ntoskrnl="exe", wdigest="dll")
+knownImageVersions = dict(ntoskrnl=list(), wdigest=list(), ci=list())
+extensions_by_mode = dict(ntoskrnl="exe", wdigest="dll", ci="dll")
+
+def find(key, value):
+    for k, v in value.items():
+        if k == key:
+            return v
+        elif isinstance(v, dict):
+            return find(key, v)
+    return None
+
+def printl(s, lock, **kwargs):
+    with lock:
+        print(s, **kwargs)
 
 def run(args, **kargs):
     """Wrap subprocess.run to works on Windows and Linux"""
@@ -23,51 +36,59 @@ def run(args, **kargs):
     shell = sys.platform in ["win32"]
     return subprocess.run(args, shell=shell, **kargs)
 
-def downloadSpecificFile(entry, pe_basename, pe_ext, knownPEVersions, output_folder):
+def downloadSpecificFile(entry, pe_basename, pe_ext, knownPEVersions, output_folder, lock):
     pe_name = f'{pe_basename}.{pe_ext}'
 
     if 'fileInfo' not in entry:
-        # print(f'[!] Entry {pe_hash} has no fileInfo, skipping it.')
+        # printl(f'[!] Entry {pe_hash} has no fileInfo, skipping it.', lock)
         return "SKIP"
     if 'timestamp' not in entry['fileInfo']:
-        # print(f'[!] Entry {pe_hash} has no timestamp, skipping it.')
+        # printl(f'[!] Entry has no timestamp, skipping it.', lock)
         return "SKIP"
     timestamp = entry['fileInfo']['timestamp']
     if 'virtualSize' not in entry['fileInfo']:
-        # print(f'[!] Entry {pe_hash} has no virtualSize, skipping it.')
+        # printl(f'[!] Entry has no virtualSize, skipping it.', lock)
         return "SKIP"
     if "machineType" not in entry["fileInfo"] or entry["fileInfo"]["machineType"] != machineType["x64"]:
+        # printl('No machine Type', lock)
         return "SKIP"
     virtual_size = entry['fileInfo']['virtualSize']
     file_id = hex(timestamp).replace('0x','').zfill(8).upper() + hex(virtual_size).replace('0x','')
     url = 'https://msdl.microsoft.com/download/symbols/' + pe_name + '/' + file_id + '/' + pe_name
-    if "version" not in entry['fileInfo']:
+    try:
+        version = entry['fileInfo']['version'].split(' ')[0]
+    except:
+        version = find('version', entry).split(' ')[0]
+        if version and version.count(".") != 3:
+            version = None
+
+    if not version:
+        printl(f'[*] Error parsing version', lock)
         return "SKIP"
-    version = entry['fileInfo']['version'].split(' ')[0]
-    
+
     # Output file format: <PE>_build-revision.<exe | dll>
     output_version = '-'.join(version.split('.')[-2:])
     output_file = f'{pe_basename}_{output_version}.{pe_ext}'
     
     # If the PE version is already known, skip download.
     if output_file in knownPEVersions:
-        print(f'[*] Skipping download of known {pe_name} version: {output_file}')
+        printl(f'[*] Skipping download of known {pe_name} version: {output_file}', lock)
         return "SKIP"
     
     output_file_path = os.path.join(output_folder, output_file)
     if os.path.isfile(output_file_path):
-        print(f"[*] Skipping {output_file_path} which already exists")
+        printl(f"[*] Skipping {output_file_path} which already exists", lock)
         return "SKIP"
     
-    print(f'[*] Downloading {pe_name} version {version}... ')
+    # printl(f'[*] Downloading {pe_name} version {version}... ', lock)
     try:
         peContent = get(url)
         with open(output_file_path, 'wb') as f:
             f.write(peContent.content)
-        print(f'[+] Finished download of {pe_name} version {version} (file: {output_file})!')
+        printl(f'[+] Finished download of {pe_name} version {version} (file: {output_file})!', lock)
         return "OK"
-    except Exception:
-        print(f'[!] ERROR : Could not download {pe_name} version {version} (URL: {url}).')
+    except Exception as e:
+        printl(f'[!] ERROR : Could not download {pe_name} version {version} (URL: {url}): {str(e)}.', lock)
         return "KO"
 
 def downloadPEFileFromMS(pe_basename, pe_ext, knownPEVersions, output_folder):
@@ -80,13 +101,16 @@ def downloadPEFileFromMS(pe_basename, pe_ext, knownPEVersions, output_folder):
     pe_list = loads(pe_json)
 
     futures = dict()
-    with ThreadPoolExecutor() as executor:
+    i = 0
+    futures = set()
+    lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=THREADS_LIMIT) as executor:
         for pe_hash in pe_list:
             entry = pe_list[pe_hash]
-            futures[pe_hash] = executor.submit(downloadSpecificFile,entry, pe_basename, pe_ext, knownPEVersions, output_folder)
-    for (i,f) in enumerate(futures):
-        res = futures[f].result()
-        print(f"{i+1}/{len(futures)}", end="\r")
+            futures.add(executor.submit(downloadSpecificFile, entry, pe_basename, pe_ext, knownPEVersions, output_folder, lock))
+        for future in as_completed(futures):
+            printl(f"{i + 1}/{len(pe_list)}", lock, end="\r")
+            i += 1
 
 def get_symbol_offset(symbols_info, symbol_name):
     for line in symbols_info:
@@ -122,11 +146,15 @@ def extractOffsets(input_file, output_file, mode):
             # check image type (ntoskrnl, wdigest, etc.)
             r = run(["r2", "-c", "iE", "-qq", input_file], capture_output=True)
             for line in r.stdout.decode().splitlines():
+                line = line.lower()
                 if "ntoskrnl.exe" in line:
                     imageType = "ntoskrnl"
                     break
                 elif "wdigest.dll" in line:
                     imageType = "wdigest"
+                    break
+                elif "ci.dll" in line:
+                    imageType = "ci"
                     break
             else:
                 print(f"[*] File {input_file} unrecognized")
@@ -149,7 +177,7 @@ def extractOffsets(input_file, output_file, mode):
                 return
             
             
-            print(f'[*] Processing {imageType} version {imageVersion} (file: {input_file})')
+            # print(f'[*] Processing {imageType} version {imageVersion} (file: {input_file})')
             # download the PDB if needed
             r = run(["r2", "-c", "idpd", "-qq", input_file], capture_output=True)
             # dump all symbols
@@ -171,6 +199,10 @@ def extractOffsets(input_file, output_file, mode):
                 symbols = [
                 ("g_fParameter_UseLogonCredential",get_symbol_offset), 
                 ("g_IsCredGuardEnabled",get_symbol_offset)
+                ]
+            elif imageType == "ci":
+                symbols = [
+                ("g_CiOptions",get_symbol_offset),
                 ]
                             
                 
@@ -197,10 +229,10 @@ def extractOffsets(input_file, output_file, mode):
 
     elif os.path.isdir(input_file):
         print(f'[*] Processing folder: {input_file}')
-        with ThreadPoolExecutor() as extractorPool:
+        with ThreadPoolExecutor(max_workers=THREADS_LIMIT) as extractorPool:
             args = [(os.path.join(input_file, file), output_file, mode) for file in os.listdir(input_file)]
-            for (i,res) in enumerate(extractorPool.map(extractOffsets, *zip(*args))):
-                print(f"{i+1}/{len(args)}", end="\r")
+            for (i, res) in enumerate(extractorPool.map(extractOffsets, *zip(*args))):
+                print(f"{i + 1}/{len(args)}", end="\r")
         print(f'[+] Finished processing of folder {input_file}!')
 
     else:
@@ -221,18 +253,18 @@ def loadOffsetsFromCSV(loadedVersions, CSVPath):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     
-    parser.add_argument('mode', help='ntoskrnl or wdigest. Mode to download and extract offsets for either ntoskrnl or wdigest')
+    parser.add_argument('mode', help='"ntoskrnl", "wdigest" or "ci". Mode to download and extract offsets from either ntoskrnl.exe, wdigest.dll or ci.dll')
     parser.add_argument('-i', '--input', dest='input', required=True,
-                        help='Single file or directory containing ntoskrnl.exe / wdigest.dll to extract offsets from. If in download mode, the PE downloaded from MS symbols servers will be placed in this folder.')
+                        help='Single file or directory containing ntoskrnl.exe / wdigest.dll / ci.dll to extract offsets from. If in download mode, the PE downloaded from MS symbols servers will be placed in this folder.')
     parser.add_argument('-o', '--output', dest='output', 
-                        help='CSV file to write offsets to. If the specified file already exists, only new ntoskrnl versions will be downloaded / analyzed. Defaults to NtoskrnlOffsets.csv / WdigestOffsets.csv in the current folder.')
+                        help='CSV file to write offsets to. If the specified file already exists, only new ntoskrnl versions will be downloaded / analyzed. Defaults to NtoskrnlOffsets.csv / WdigestOffsets.csv / CiOffsets.csv in the current folder.')
     parser.add_argument('-d', '--download', dest='download', action='store_true',
                         help='Flag to download the PE from Microsoft servers using list of versions from winbindex.m417z.com.')
     
     args = parser.parse_args()
     mode = args.mode.lower()
     if mode not in knownImageVersions:
-        print(f'[!] ERROR : unsupported mode "{args.mode}", supported mode are: "ntoskrnl" and "wdigest"')      
+        print(f'[!] ERROR : unsupported mode "{args.mode}", supported mode are: "ntoskrnl", "wdigest" and "ci"')
         exit(1)
     
     # check R2 version
@@ -248,7 +280,7 @@ if __name__ == '__main__':
      * a simple tag "5.8.2-158-gca9763f20d"
     """
     ma,me,mi = map(int, output.splitlines()[0].split(" ")[0].split("-")[0].split("."))
-    if (ma, me, mi) < (5,0,0):
+    if (ma, me, mi) < (5, 0, 0):
         print("WARNING : This script has been tested with radare2 5.0.0 (works) and 4.3.1 (does NOT work)")
         print(f"You have version {ma}.{me}.{mi}, if is does not work correctly, meaning most of the offsets are not found (i.e. 0), check radare2's 'idpi' command output and modify get_symbol_offset() & get_field_offset() to parse symbols correctly")
         input("Press enter to continue")
@@ -276,6 +308,8 @@ if __name__ == '__main__':
                 output.write('ntoskrnlVersion,PspCreateProcessNotifyRoutineOffset,PspCreateThreadNotifyRoutineOffset,PspLoadImageNotifyRoutineOffset,_PS_PROTECTIONOffset,EtwThreatIntProvRegHandleOffset,EtwRegEntry_GuidEntryOffset,EtwGuidEntry_ProviderEnableInfoOffset,PsProcessType,PsThreadType,CallbackList\n')
             elif mode == "wdigest":
                 output.write('wdigestVersion,g_fParameter_UseLogonCredentialOffset,g_IsCredGuardEnabledOffset\n')
+            elif mode == "ci":
+                output.write('g_CiOptionsOffset\n')
             else:
                 assert False
     # In download mode, an updated list of image versions published will be retrieved from https://winbindex.m417z.com.
